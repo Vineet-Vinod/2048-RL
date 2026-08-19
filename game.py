@@ -172,6 +172,36 @@ def spawn_tile(board: Board, rng: random.Random | None = None) -> Board:
     return result
 
 
+def new_game(rng: random.Random | None = None) -> Board:
+    """Create a standard starting board with two independently sampled tiles."""
+    board = [[0] * 4 for _ in range(4)]
+    board = spawn_tile(board, rng)
+    return spawn_tile(board, rng)
+
+
+def legal_actions(board: Board) -> List[str]:
+    """Return directions that change the board before a random tile spawns."""
+    return [
+        direction
+        for direction in DIRECTIONS
+        if slide(board, direction)[0] != board
+    ]
+
+
+def step(
+    board: Board,
+    direction: str,
+    rng: random.Random | None = None,
+) -> tuple[Board, int, bool]:
+    """Sample one environment transition for model-free training."""
+    moved, score = slide(board, direction)
+    if moved == board:
+        raise ValueError(f"illegal action {direction!r} for this board")
+
+    next_board = spawn_tile(moved, rng)
+    return next_board, score, game_over(next_board)
+
+
 def spawn_outcomes(board: Board) -> List[tuple[float, Board]]:
     """Enumerate every random spawn and its probability for Bellman search."""
     cells = empty_cells(board)
