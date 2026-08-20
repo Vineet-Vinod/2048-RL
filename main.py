@@ -42,10 +42,10 @@ class TrainingConfig:
     episodes: int = 2_500
     gamma: float = 0.99
     learning_rate: float = 3e-4
-    batch_size: int = 128
+    batch_size: int = 1_024
     replay_capacity: int = 200_000
     warmup_examples: int = 2_000
-    train_every: int = 4
+    train_every: int = 32
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
     epsilon_decay_steps: int = 100_000
@@ -111,6 +111,16 @@ def encode_board(board: Board | np.ndarray) -> np.ndarray:
     tiles = np.minimum(tiles, TILE_CHANNELS - 1)
     encoded = np.eye(TILE_CHANNELS, dtype=np.float32)[tiles]
     return np.ascontiguousarray(encoded.transpose(2, 0, 1))
+
+
+def encode_boards(boards: np.ndarray) -> np.ndarray:
+    """Encode a batch of tile-exponent boards without a Python board loop."""
+    tiles = np.asarray(boards, dtype=np.int64)
+    if tiles.ndim != 3 or tiles.shape[1:] != (4, 4) or np.any(tiles < 0):
+        raise ValueError("boards must have shape (batch, 4, 4) and be nonnegative")
+    tiles = np.minimum(tiles, TILE_CHANNELS - 1)
+    encoded = np.eye(TILE_CHANNELS, dtype=np.float32)[tiles]
+    return np.ascontiguousarray(encoded.transpose(0, 3, 1, 2))
 
 
 def freeze_board(board: Board) -> FrozenBoard:
@@ -204,8 +214,8 @@ def estimate_boards(
     values = []
     with torch.no_grad():
         for start in range(0, len(boards), batch_size):
-            batch = np.stack(
-                [encode_board(board) for board in boards[start : start + batch_size]]
+            batch = encode_boards(
+                np.asarray(boards[start : start + batch_size], dtype=np.int16)
             )
             predictions = network(torch.from_numpy(batch).to(device))
             values.append(predictions.cpu().numpy())
@@ -340,6 +350,7 @@ def rollout_worker_loop(
     policy_queue,
     result_queue,
     stop_event,
+    queue_wait_seconds,
 ) -> None:
     """Continuously produce trajectories while the learner trains."""
     initialize_rollout_worker()
@@ -378,12 +389,14 @@ def rollout_worker_loop(
                 )
                 episode_sequence += 1
 
+                wait_started = time.perf_counter()
                 while not stop_event.is_set():
                     try:
                         result_queue.put(result, timeout=0.5)
                         break
                     except Full:
                         continue
+                queue_wait_seconds.value += time.perf_counter() - wait_started
     except BaseException as error:
         failure = WorkerFailure(worker, str(error), traceback.format_exc())
         while not stop_event.is_set():
@@ -420,11 +433,25 @@ def discounted_returns(rewards: list[float], gamma: float) -> list[float]:
     return returns
 
 
-def augment_board(board: np.ndarray, rng: random.Random) -> np.ndarray:
-    """Apply one of the eight rotations and reflections that preserve value."""
-    transformed = np.rot90(board, rng.randrange(4))
-    if rng.random() < 0.5:
-        transformed = np.fliplr(transformed)
+def augment_boards(boards: np.ndarray, rng: random.Random) -> np.ndarray:
+    """Apply independent 2048 symmetries to an entire board batch."""
+    transformations = np.fromiter(
+        (rng.randrange(8) for _ in range(len(boards))),
+        dtype=np.int8,
+        count=len(boards),
+    )
+    rotations = transformations % 4
+    transformed = np.empty_like(boards)
+    for rotation in range(4):
+        selected = rotations == rotation
+        if np.any(selected):
+            transformed[selected] = np.rot90(
+                boards[selected],
+                rotation,
+                axes=(1, 2),
+            )
+    reflected = transformations >= 4
+    transformed[reflected] = transformed[reflected, :, ::-1]
     return np.ascontiguousarray(transformed)
 
 
@@ -437,22 +464,31 @@ def optimize_batch(
     device: torch.device,
 ) -> float:
     examples = rng.sample(replay, config.batch_size)
-    states = np.stack(
-        [encode_board(augment_board(example.board, rng)) for example in examples]
-    )
-    targets = torch.tensor(
-        [example.target for example in examples],
-        dtype=torch.float32,
-        device=device,
+    boards = np.stack([example.board for example in examples])
+    states = encode_boards(augment_boards(boards, rng))
+    targets = torch.from_numpy(
+        np.fromiter(
+            (example.target for example in examples),
+            dtype=np.float32,
+            count=len(examples),
+        )
     )
 
     predictions = network(torch.from_numpy(states).to(device))
-    loss = F.smooth_l1_loss(predictions, targets)
+    loss = F.smooth_l1_loss(predictions, targets.to(device))
     optimizer.zero_grad()
     loss.backward()
     nn.utils.clip_grad_norm_(network.parameters(), max_norm=10.0)
     optimizer.step()
     return float(loss.item())
+
+
+def queue_depth(result_queue) -> str:
+    """Return queue occupancy where the multiprocessing backend supports it."""
+    try:
+        return str(result_queue.qsize())
+    except (NotImplementedError, OSError):
+        return "?"
 
 
 def train(
@@ -494,10 +530,17 @@ def train(
         f"for {config.episodes:,} episodes with depth-{search_depth} expectimax "
         f"and {workers} asynchronous rollout worker{'s' if workers != 1 else ''}"
     )
+    print(
+        f"Learner batch {config.batch_size:,}, one optimizer step per "
+        f"{config.train_every} new states, rollout buffer {rollout_buffer}"
+    )
 
     context = mp.get_context("spawn")
     result_queue = context.Queue(maxsize=rollout_buffer)
     policy_queues = [context.Queue() for _ in range(workers)]
+    queue_wait_seconds = [
+        context.Value("d", 0.0, lock=False) for _ in range(workers)
+    ]
     stop_event = context.Event()
     processes = [
         context.Process(
@@ -513,6 +556,7 @@ def train(
                 policy_queues[worker],
                 result_queue,
                 stop_event,
+                queue_wait_seconds[worker],
             ),
             name=f"rollout-{worker}",
         )
@@ -524,10 +568,13 @@ def train(
         process.start()
 
     completed_episodes = 0
+    pending_training_states = 0
+    next_policy_sync = policy_sync_every
+    next_checkpoint = config.checkpoint_every or None
     try:
         while completed_episodes < config.episodes:
             try:
-                message = result_queue.get(timeout=60.0)
+                first_message = result_queue.get(timeout=60.0)
             except Empty:
                 failed = [
                     process
@@ -542,26 +589,71 @@ def train(
                     raise RuntimeError(f"Rollout workers failed: {details}")
                 continue
 
-            if isinstance(message, WorkerFailure):
-                raise RuntimeError(
-                    f"Rollout worker {message.worker} failed: {message.message}\n"
-                    f"{message.details}"
-                )
-            result = message
-            completed_episodes += 1
-
-            returns = discounted_returns(result.rewards, config.gamma)
-            replay.extend(
-                ValueExample(board=state, target=target)
-                for state, target in zip(result.boards, returns)
+            rollout_batch = [first_message]
+            max_rollout_batch = min(
+                rollout_buffer,
+                config.episodes - completed_episodes,
             )
-            total_steps += len(result.boards)
+            while len(rollout_batch) < max_rollout_batch:
+                try:
+                    rollout_batch.append(result_queue.get_nowait())
+                except Empty:
+                    break
 
-            if (
-                len(replay) >= max(config.warmup_examples, config.batch_size)
-                and result.boards
-            ):
-                update_count = max(1, len(result.boards) // config.train_every)
+            new_states = 0
+            report_rows = []
+            policy_sync_due = False
+            checkpoint_due = False
+            for message in rollout_batch:
+                if isinstance(message, WorkerFailure):
+                    raise RuntimeError(
+                        f"Rollout worker {message.worker} failed: {message.message}\n"
+                        f"{message.details}"
+                    )
+                result = message
+                completed_episodes += 1
+
+                returns = discounted_returns(result.rewards, config.gamma)
+                replay.extend(
+                    ValueExample(board=state, target=target)
+                    for state, target in zip(result.boards, returns)
+                )
+                state_count = len(result.boards)
+                new_states += state_count
+                total_steps += state_count
+                recent_scores.append(result.score)
+
+                if completed_episodes >= next_policy_sync:
+                    policy_sync_due = True
+                    while next_policy_sync <= completed_episodes:
+                        next_policy_sync += policy_sync_every
+
+                if next_checkpoint is not None and completed_episodes >= next_checkpoint:
+                    checkpoint_due = True
+                    while next_checkpoint <= completed_episodes:
+                        next_checkpoint += config.checkpoint_every
+
+                if (
+                    completed_episodes == 1
+                    or completed_episodes % report_every == 0
+                    or completed_episodes == config.episodes
+                ):
+                    report_rows.append(
+                        (
+                            completed_episodes,
+                            result,
+                            sum(recent_scores) / len(recent_scores),
+                            epsilon_at(total_steps, config),
+                        )
+                    )
+
+            update_count = 0
+            if len(replay) >= max(config.warmup_examples, config.batch_size):
+                pending_training_states += new_states
+                update_count, pending_training_states = divmod(
+                    pending_training_states,
+                    config.train_every,
+                )
                 for _ in range(update_count):
                     last_loss = optimize_batch(
                         network,
@@ -571,36 +663,35 @@ def train(
                         replay_rng,
                         device,
                     )
+            else:
+                pending_training_states = 0
 
-            if completed_episodes % policy_sync_every == 0:
+            if policy_sync_due:
                 publish_policy(
                     network,
                     epsilon_at(total_steps, config),
                     policy_queues,
                 )
 
-            recent_scores.append(result.score)
-            if (
-                completed_episodes == 1
-                or completed_episodes % report_every == 0
-                or completed_episodes == config.episodes
-            ):
-                average_score = sum(recent_scores) / len(recent_scores)
+            for episode_number, result, average_score, epsilon in report_rows:
                 elapsed = time.perf_counter() - training_started
-                episodes_per_second = completed_episodes / max(elapsed, 1e-9)
+                episodes_per_second = episode_number / max(elapsed, 1e-9)
+                producer_wait = 100.0 * sum(
+                    counter.value for counter in queue_wait_seconds
+                ) / max(workers * elapsed, 1e-9)
                 print(
-                    f"episode {completed_episodes:>5}/{config.episodes}  "
+                    f"episode {episode_number:>5}/{config.episodes}  "
                     f"score {result.score:>6}  avg100 {average_score:>8.1f}  "
                     f"max {result.max_tile:>5}  "
-                    f"epsilon {epsilon_at(total_steps, config):.3f}  "
+                    f"epsilon {epsilon:.3f}  "
                     f"value-loss {last_loss:.4f}  "
-                    f"rate {episodes_per_second:.2f} ep/s"
+                    f"rate {episodes_per_second:.2f} ep/s  "
+                    f"rollouts {len(rollout_batch):>3}  updates {update_count:>3}  "
+                    f"queue {queue_depth(result_queue)}/{rollout_buffer}  "
+                    f"producer-wait {producer_wait:>5.1f}%"
                 )
 
-            if (
-                config.checkpoint_every
-                and completed_episodes % config.checkpoint_every == 0
-            ):
+            if checkpoint_due:
                 save_weights(network, checkpoint_path)
     finally:
         stop_event.set()
@@ -720,6 +811,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weights", type=Path, default=WEIGHTS_PATH)
     parser.add_argument("--checkpoint-every", type=int, default=1_000)
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1_024,
+        help="replay examples per optimizer step",
+    )
+    parser.add_argument(
+        "--train-every",
+        type=int,
+        default=32,
+        help="new board states earned per optimizer step",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=default_worker_count(),
@@ -763,6 +866,10 @@ def main() -> None:
         raise SystemExit("Policy sync interval cannot be negative")
     if args.rollout_buffer < 0:
         raise SystemExit("Rollout buffer cannot be negative")
+    if args.batch_size < 1:
+        raise SystemExit("Batch size must be at least one")
+    if args.train_every < 1:
+        raise SystemExit("Training interval must be at least one")
     device = select_device(args.device)
 
     if args.play_only:
@@ -778,6 +885,8 @@ def main() -> None:
         config = TrainingConfig(
             episodes=args.episodes,
             checkpoint_every=args.checkpoint_every,
+            batch_size=args.batch_size,
+            train_every=args.train_every,
         )
         network = train(
             config,
