@@ -17,9 +17,9 @@ from torch.nn import functional as F
 from game import Board, DIRECTIONS, bprint, legal_actions, new_game, step
 
 
-WEIGHTS_PATH = Path(__file__).resolve().with_name("dqn_2048.pt")
+WEIGHTS_PATH = Path(__file__).resolve().with_name("dqn_2048_cnn.pt")
 ACTION_TO_INDEX = {action: index for index, action in enumerate(DIRECTIONS)}
-STATE_SCALE = 16.0
+TILE_CHANNELS = 16
 REWARD_SCALE = 16.0
 
 
@@ -49,22 +49,25 @@ class Transition(NamedTuple):
 
 
 class QNetwork(nn.Module):
-    """A 25,076-parameter approximation of Q(board, action)."""
+    """An 87,428-parameter convolutional approximation of Q(board, action)."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(16, 128),
+        self.features = nn.Sequential(
+            nn.Conv2d(TILE_CHANNELS, 64, kernel_size=2),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Conv2d(64, 64, kernel_size=2),
             nn.ReLU(),
-            nn.Linear(128, 48),
+        )
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 2 * 2, 256),
             nn.ReLU(),
-            nn.Linear(48, len(DIRECTIONS)),
+            nn.Linear(256, len(DIRECTIONS)),
         )
 
     def forward(self, states: Tensor) -> Tensor:
-        return self.layers(states)
+        return self.head(self.features(states))
 
     @property
     def parameter_count(self) -> int:
@@ -72,8 +75,17 @@ class QNetwork(nn.Module):
 
 
 def encode_board(board: Board) -> np.ndarray:
-    """Flatten exponent-valued tiles and keep network inputs near unit scale."""
-    return np.asarray(board, dtype=np.float32).reshape(16) / STATE_SCALE
+    """Encode tile exponents as 16 one-hot 4x4 planes.
+
+    Channel zero represents empty cells. The final channel also handles any
+    exponent above 15 so unusually long games remain playable.
+    """
+    tiles = np.asarray(board, dtype=np.int64)
+    if tiles.shape != (4, 4) or np.any(tiles < 0):
+        raise ValueError("board must be a 4x4 grid of nonnegative exponents")
+    tiles = np.minimum(tiles, TILE_CHANNELS - 1)
+    encoded = np.eye(TILE_CHANNELS, dtype=np.float32)[tiles]
+    return np.ascontiguousarray(encoded.transpose(2, 0, 1))
 
 
 def legal_mask(board: Board) -> np.ndarray:
@@ -261,7 +273,12 @@ def save_weights(network: QNetwork, path: Path) -> None:
 def load_weights(path: Path, device: torch.device) -> QNetwork:
     network = QNetwork().to(device)
     state_dict = torch.load(path, map_location=device, weights_only=True)
-    network.load_state_dict(state_dict)
+    try:
+        network.load_state_dict(state_dict)
+    except RuntimeError as error:
+        raise ValueError(
+            f"{path} does not contain weights for the current CNN architecture"
+        ) from error
     network.eval()
     return network
 
@@ -345,7 +362,10 @@ def main() -> None:
     if args.play_only:
         if not args.weights.exists():
             raise SystemExit(f"Weights do not exist: {args.weights}")
-        network = load_weights(args.weights, device)
+        try:
+            network = load_weights(args.weights, device)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
     else:
         config = TrainingConfig(episodes=args.episodes)
         network = train(config, args.seed, device)
