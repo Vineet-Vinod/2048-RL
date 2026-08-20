@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import math
+import multiprocessing as mp
+import os
 import random
 import time
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, NamedTuple
@@ -52,6 +55,24 @@ class TrainingConfig:
 class ValueExample(NamedTuple):
     board: np.ndarray
     target: float
+
+
+class EpisodeResult(NamedTuple):
+    episode: int
+    boards: list[np.ndarray]
+    rewards: list[float]
+    score: int
+    max_tile: int
+
+
+class RolloutTask(NamedTuple):
+    state_dict: dict[str, Tensor]
+    episodes: tuple[int, ...]
+    seed: int
+    epsilon: float
+    search_depth: int
+    gamma: float
+    max_steps: int
 
 
 class ValueNetwork(nn.Module):
@@ -258,6 +279,82 @@ def epsilon_at(step_count: int, config: TrainingConfig) -> float:
     return config.epsilon_end + (config.epsilon_start - config.epsilon_end) * decay
 
 
+def generate_episode(
+    network: ValueNetwork,
+    episode: int,
+    seed: int,
+    epsilon: float,
+    search_depth: int,
+    gamma: float,
+    max_steps: int,
+    device: torch.device,
+) -> EpisodeResult:
+    """Generate one independent self-play trajectory from a fixed policy."""
+    seed_offset = (episode - 1) * 2
+    environment_rng = random.Random(seed + seed_offset)
+    policy_rng = random.Random(seed + seed_offset + 1)
+    board = new_game(environment_rng)
+    boards: list[np.ndarray] = []
+    rewards: list[float] = []
+    score = 0
+
+    for _ in range(max_steps):
+        if game_over(board):
+            break
+        boards.append(np.asarray(board, dtype=np.int16))
+        action, _ = choose_action(
+            network,
+            board,
+            search_depth,
+            gamma,
+            epsilon,
+            policy_rng,
+            device,
+        )
+        board, merge_score, terminal = step(board, action, environment_rng)
+        rewards.append(merge_score / REWARD_SCALE)
+        score += merge_score
+        if terminal:
+            break
+
+    max_tile = 2 ** max(tile for row in board for tile in row)
+    return EpisodeResult(episode, boards, rewards, score, max_tile)
+
+
+def initialize_rollout_worker() -> None:
+    """Keep multiple worker processes from each starting a CPU thread pool."""
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
+
+def run_rollout_task(task: RolloutTask) -> list[EpisodeResult]:
+    """Rebuild a CPU policy snapshot and generate a group of episodes."""
+    device = torch.device("cpu")
+    network = ValueNetwork().to(device)
+    network.load_state_dict(task.state_dict)
+    network.eval()
+    return [
+        generate_episode(
+            network,
+            episode,
+            task.seed,
+            task.epsilon,
+            task.search_depth,
+            task.gamma,
+            task.max_steps,
+            device,
+        )
+        for episode in task.episodes
+    ]
+
+
+def cpu_state_dict(network: ValueNetwork) -> dict[str, Tensor]:
+    return {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in network.state_dict().items()
+    }
+
+
 def discounted_returns(rewards: list[float], gamma: float) -> list[float]:
     returns = [0.0] * len(rewards)
     running_return = 0.0
@@ -308,10 +405,15 @@ def train(
     device: torch.device,
     search_depth: int,
     checkpoint_path: Path,
+    workers: int,
+    episodes_per_worker: int,
 ) -> ValueNetwork:
-    """Alternate sampled policy games with Monte Carlo value regression."""
-    environment_rng = random.Random(seed)
-    policy_rng = random.Random(seed + 1)
+    """Alternate parallel policy rollouts with central value regression."""
+    if workers < 1:
+        raise ValueError("workers must be at least one")
+    if episodes_per_worker < 1:
+        raise ValueError("episodes per worker must be at least one")
+
     replay_rng = random.Random(seed + 2)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -323,73 +425,120 @@ def train(
     total_steps = 0
     last_loss = 0.0
     report_every = max(1, config.episodes // 20)
+    training_started = time.perf_counter()
 
     print(
         f"Training {network.parameter_count:,} value-network parameters on {device} "
-        f"for {config.episodes:,} episodes with depth-{search_depth} expectimax"
+        f"for {config.episodes:,} episodes with depth-{search_depth} expectimax "
+        f"and {workers} rollout worker{'s' if workers != 1 else ''}"
     )
 
-    for episode in range(1, config.episodes + 1):
-        board = new_game(environment_rng)
-        episode_boards: list[np.ndarray] = []
-        episode_rewards: list[float] = []
-        game_score = 0
-
-        for _ in range(config.max_steps_per_episode):
-            if game_over(board):
-                break
-            episode_boards.append(np.asarray(board, dtype=np.int16))
-            epsilon = epsilon_at(total_steps, config)
-            action, _ = choose_action(
-                network,
-                board,
-                search_depth,
-                config.gamma,
-                epsilon,
-                policy_rng,
-                device,
-            )
-            board, merge_score, terminal = step(board, action, environment_rng)
-            episode_rewards.append(merge_score / REWARD_SCALE)
-            game_score += merge_score
-            total_steps += 1
-            if terminal:
-                break
-
-        returns = discounted_returns(episode_rewards, config.gamma)
-        replay.extend(
-            ValueExample(board=state, target=target)
-            for state, target in zip(episode_boards, returns)
+    executor = None
+    if workers > 1:
+        executor = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp.get_context("spawn"),
+            initializer=initialize_rollout_worker,
         )
 
-        if (
-            len(replay) >= max(config.warmup_examples, config.batch_size)
-            and episode_boards
-        ):
-            update_count = max(1, len(episode_boards) // config.train_every)
-            for _ in range(update_count):
-                last_loss = optimize_batch(
-                    network,
-                    optimizer,
-                    replay,
-                    config,
-                    replay_rng,
-                    device,
+    completed_episodes = 0
+    try:
+        while completed_episodes < config.episodes:
+            if executor is None:
+                episode_numbers = [completed_episodes + 1]
+            else:
+                round_size = workers * episodes_per_worker
+                round_end = min(config.episodes, completed_episodes + round_size)
+                episode_numbers = list(range(completed_episodes + 1, round_end + 1))
+
+            epsilon = epsilon_at(total_steps, config)
+            if executor is None:
+                results = [
+                    generate_episode(
+                        network,
+                        episode_numbers[0],
+                        seed,
+                        epsilon,
+                        search_depth,
+                        config.gamma,
+                        config.max_steps_per_episode,
+                        device,
+                    )
+                ]
+            else:
+                snapshot = cpu_state_dict(network)
+                groups = [
+                    tuple(episode_numbers[start : start + episodes_per_worker])
+                    for start in range(0, len(episode_numbers), episodes_per_worker)
+                ]
+                futures = [
+                    executor.submit(
+                        run_rollout_task,
+                        RolloutTask(
+                            state_dict=snapshot,
+                            episodes=group,
+                            seed=seed,
+                            epsilon=epsilon,
+                            search_depth=search_depth,
+                            gamma=config.gamma,
+                            max_steps=config.max_steps_per_episode,
+                        ),
+                    )
+                    for group in groups
+                ]
+                results = [result for future in futures for result in future.result()]
+                results.sort(key=lambda result: result.episode)
+
+            for result in results:
+                returns = discounted_returns(result.rewards, config.gamma)
+                replay.extend(
+                    ValueExample(board=state, target=target)
+                    for state, target in zip(result.boards, returns)
                 )
+                total_steps += len(result.boards)
 
-        recent_scores.append(game_score)
-        if episode == 1 or episode % report_every == 0 or episode == config.episodes:
-            average_score = sum(recent_scores) / len(recent_scores)
-            max_tile = 2 ** max(tile for row in board for tile in row)
-            print(
-                f"episode {episode:>5}/{config.episodes}  "
-                f"score {game_score:>6}  avg100 {average_score:>8.1f}  "
-                f"max {max_tile:>5}  epsilon {epsilon_at(total_steps, config):.3f}  "
-                f"value-loss {last_loss:.4f}"
-            )
+                if (
+                    len(replay) >= max(config.warmup_examples, config.batch_size)
+                    and result.boards
+                ):
+                    update_count = max(1, len(result.boards) // config.train_every)
+                    for _ in range(update_count):
+                        last_loss = optimize_batch(
+                            network,
+                            optimizer,
+                            replay,
+                            config,
+                            replay_rng,
+                            device,
+                        )
 
-        if config.checkpoint_every and episode % config.checkpoint_every == 0:
-            save_weights(network, checkpoint_path)
+                completed_episodes = result.episode
+                recent_scores.append(result.score)
+                if (
+                    result.episode == 1
+                    or result.episode % report_every == 0
+                    or result.episode == config.episodes
+                ):
+                    average_score = sum(recent_scores) / len(recent_scores)
+                    elapsed = time.perf_counter() - training_started
+                    episodes_per_second = result.episode / max(elapsed, 1e-9)
+                    print(
+                        f"episode {result.episode:>5}/{config.episodes}  "
+                        f"score {result.score:>6}  avg100 {average_score:>8.1f}  "
+                        f"max {result.max_tile:>5}  "
+                        f"epsilon {epsilon_at(total_steps, config):.3f}  "
+                        f"value-loss {last_loss:.4f}  "
+                        f"rate {episodes_per_second:.2f} ep/s"
+                    )
+
+                if (
+                    config.checkpoint_every
+                    and result.episode % config.checkpoint_every == 0
+                ):
+                    save_weights(network, checkpoint_path)
+    finally:
+        if executor is not None:
+            executor.shutdown()
 
     return network
 
@@ -476,6 +625,10 @@ def select_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
+def default_worker_count() -> int:
+    return max(1, (os.cpu_count() or 2) - 1)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train and play 2048 with neural value-guided expectimax"
@@ -489,6 +642,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weights", type=Path, default=WEIGHTS_PATH)
     parser.add_argument("--checkpoint-every", type=int, default=1_000)
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=default_worker_count(),
+        help="CPU processes used to generate self-play episodes",
+    )
+    parser.add_argument(
+        "--episodes-per-worker",
+        type=int,
+        default=1,
+        help="episodes generated from each policy snapshot per worker",
+    )
+    parser.add_argument(
         "--play-only",
         action="store_true",
         help="load existing value weights instead of training",
@@ -500,6 +665,10 @@ def main() -> None:
     args = parse_args()
     if args.search_depth < 1:
         raise SystemExit("Search depth must be at least one")
+    if args.workers < 1:
+        raise SystemExit("Workers must be at least one")
+    if args.episodes_per_worker < 1:
+        raise SystemExit("Episodes per worker must be at least one")
     device = select_device(args.device)
 
     if args.play_only:
@@ -520,6 +689,8 @@ def main() -> None:
             device,
             args.search_depth,
             args.weights,
+            args.workers,
+            args.episodes_per_worker,
         )
         save_weights(network, args.weights)
 
